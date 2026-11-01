@@ -312,3 +312,23 @@ def human_size(size: int) -> str:
             return f"{size} {unit}" if unit == "bytes" else f"{size:.1f} {unit}"
         size /= 1024
     return f"{size:.1f} TB"
+
+
+# ---------------------------------------------------------------------------
+# Folders the user may not pick
+# ---------------------------------------------------------------------------
+
+# Folder names that belong to Windows or installed apps.
+SYSTEM_FOLDER_NAMES = {"windows", "program files", "program files (x86)", "programdata", "appdata"}
+
+
+def protected_reason(folder: Path) -> str | None:
+    """Return why a folder must not be scanned, or None if it's fine."""
+    folder = folder.resolve()
+    if folder.parent == folder:
+        return "it's a whole drive"
+    if folder == Path.home().resolve():
+        return "it's your whole user folder (pick folders inside it instead)"
+    if any(part.lower() in SYSTEM_FOLDER_NAMES for part in folder.parts):
+        return "it belongs to Windows or an installed app"
+    return None
