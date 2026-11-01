@@ -8,8 +8,11 @@ import os
 import stat
 from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
+
+from send2trash import send2trash
 
 QUICK_HASH_BYTES = 64 * 1024   # first 64 KB: a cheap first check
 READ_CHUNK = 1024 * 1024       # read big files 1 MB at a time
@@ -134,6 +137,17 @@ class DuplicateGroup:
         """Bytes freed by removing every copy except one."""
         return self.size * (len(self.files) - 1)
 
+    @property
+    def keeper(self) -> Path:
+        return self.files[0]
+
+    def set_keeper(self, path: Path) -> None:
+        """Choose which copy to keep by moving it to the front."""
+        if path not in self.files:
+            raise ValueError(f"{path} is not in this group")
+        self.files.remove(path)
+        self.files.insert(0, path)
+
 
 def keeper_order(path: Path) -> tuple:
     """Sort key: shortest path first, so 'photo.jpg' beats 'photo (1).jpg'
@@ -190,3 +204,111 @@ def find_duplicates(
 
     groups.sort(key=lambda g: (-g.wasted, str(g.files[0]).lower()))
     return groups, problems
+
+
+# ---------------------------------------------------------------------------
+# Step 3: remove the extra copies, keeping one from every group
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Removal:
+    path: Path     # the copy to remove
+    keeper: Path   # the copy that stays
+    size: int
+
+
+@dataclass
+class RemoveResult:
+    done: int = 0
+    freed: int = 0  # bytes
+    failed: list[str] = field(default_factory=list)  # friendly messages
+
+
+def plan_removals(groups: list[DuplicateGroup]) -> list[Removal]:
+    """Every copy except the keeper, from every group."""
+    return [
+        Removal(path=path, keeper=group.keeper, size=group.size)
+        for group in groups
+        for path in group.files[1:]
+    ]
+
+
+def remove_copies(
+    removals: list[Removal],
+    log_path: Path,
+    trash: Callable[[str], None] = send2trash,
+    hasher: Callable[[Path, int | None], str] = file_hash,
+) -> RemoveResult:
+    """Send each planned copy to the Recycle Bin, after checking it again.
+
+    Right before removing a copy, both it AND its keeper are re-checked
+    (exists, same size, same full hash). If anything changed since the scan,
+    that copy is left alone. This is what guarantees the last copy of a
+    file is never removed.
+
+    Each removal is appended to a plain-text log, so you can see what went
+    to the Recycle Bin and restore it from there if needed.
+    `trash` and `hasher` are swappable so tests never touch the real Recycle Bin.
+    """
+    result = RemoveResult()
+    keeper_hashes: dict[Path, str | None] = {}
+
+    def full_hash(path: Path) -> str | None:
+        try:
+            return hasher(path, None)
+        except OSError:
+            return None
+
+    for removal in removals:
+        path, keeper = removal.path, removal.keeper
+
+        problem = None
+        if path.resolve() == keeper.resolve():
+            problem = "it's the copy being kept"
+        elif not keeper.is_file() or keeper.stat().st_size != removal.size:
+            problem = "the copy being kept is missing or changed, so this one was kept too"
+        elif not path.is_file():
+            problem = "it's already gone"
+        elif path.stat().st_size != removal.size:
+            problem = "it changed since the scan"
+        else:
+            if keeper not in keeper_hashes:
+                keeper_hashes[keeper] = full_hash(keeper)
+            keeper_hash = keeper_hashes[keeper]
+            path_hash = full_hash(path)
+            if keeper_hash is None or path_hash is None:
+                problem = "couldn't read it (it may be open in another app)"
+            elif keeper_hash != path_hash:
+                problem = "it's no longer identical to the copy being kept"
+
+        if problem:
+            result.failed.append(f"{path.name}: skipped, {problem}")
+            continue
+
+        try:
+            trash(str(path))
+        except OSError:
+            result.failed.append(f"{path.name}: couldn't remove it (it may be open in another app)")
+            continue
+
+        append_log(log_path, f"removed {path}  (copy of {keeper})")
+        result.done += 1
+        result.freed += removal.size
+
+    return result
+
+
+def append_log(log_path: Path, line: str) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"{stamp}  {line}\n")
+
+
+def human_size(size: int) -> str:
+    """1536 -> '1.5 KB'"""
+    for unit in ("bytes", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size} {unit}" if unit == "bytes" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
